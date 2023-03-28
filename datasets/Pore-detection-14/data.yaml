@@ -1,12 +1,13 @@
-names:
-- Pores
+train: pore-detection-14/train/images
+val: pore-detection-14/valid/images
+test: pore-detection-14/test/images
+
 nc: 1
+names: ['Pores']
+
 roboflow:
-  license: Private
-  project: pore-detection
-  url: https://app.roboflow.com/skin-care/pore-detection/14
-  version: 14
   workspace: skin-care
-test: ../test/images
-train: Pore-detection-14/train/images
-val: Pore-detection-14/valid/images
+  project: pore-detection
+  version: 14
+  license: Private
+  url: https://app.roboflow.com/skin-care/pore-detection/14

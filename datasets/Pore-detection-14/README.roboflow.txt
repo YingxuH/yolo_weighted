@@ -2,7 +2,7 @@
 Pore detection - v14 2023-01-30 2:06am
 ==============================
 
-This dataset was exported via roboflow.com on January 29, 2023 at 6:10 PM GMT
+This dataset was exported via roboflow.com on March 16, 2023 at 6:57 PM GMT
 
 Roboflow is an end-to-end computer vision platform that helps you
 * collaborate with your team on computer vision projects
@@ -18,7 +18,7 @@ visit https://github.com/roboflow/notebooks
 To find over 100k other datasets and pre-trained models, visit https://universe.roboflow.com
 
 The dataset includes 148 images.
-Pores are annotated in YOLO v5 PyTorch format.
+Pores are annotated in YOLOv8 format.
 
 The following pre-processing was applied to each image:
 

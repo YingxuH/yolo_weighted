@@ -7,6 +7,7 @@ from distutils.dir_util import copy_tree
 from src.utils import *
 
 import torch
+from torchvision.ops import nms
 import pandas as pd
 import numpy as np
 
@@ -93,27 +94,39 @@ def _process_batch(detections, labels, enable_iop=False):
     correct = np.zeros((detections.shape[0], iouv.shape[0])).astype(bool)
     correct_class = labels[:, 0:1] == detections[:, 5]
 
-    all_matches = []
     all_indices = []
+    all_matches = []
+    all_original_matches = []
     for i in range(len(iouv)):
         if enable_iop:
-            iou_idx = (iou >= iouv[i]) | ((iou >= (iouv[i]*0.5)) & (iop > 0.9)) | ((iou >= (iouv[i]*0.8)) & (iol > 0.9))
+            match = iou >= iouv[i]
+            supression = ((iou >= (iouv[i]*0.5)) & (iop > 0.99)) | ((iou >= (iouv[i]*0.5)) & (iol > 0.99))
+            partial_supression = ((iou >= (iouv[i]*0.8)) & (iop > 0.9)) | ((iou >= (iouv[i]*0.8)) & (iol > 0.9))
+            iou_idx = match | supression | partial_supression
         else:
             iou_idx = iou >= iouv[i]
         x = torch.where(iou_idx & correct_class)  # IoU > threshold and classes match
         matches = np.zeros((x[0].shape[0], 3))
+        original_matches = copy.deepcopy(matches)
         if x[0].shape[0]:
             matches = torch.cat((torch.stack(x, 1), iou[x[0], x[1]][:, None]),
                                 1).cpu().numpy()  # [label, detect, iou]
+            original_matches = copy.deepcopy(matches)
             if x[0].shape[0] > 1:
                 matches = matches[matches[:, 2].argsort()[::-1]] # sort matches by iou
                 matches = matches[np.unique(matches[:, 1], return_index=True)[1]] # drop duplicates
+                original_matches = copy.deepcopy(matches)
                 # matches = matches[matches[:, 2].argsort()[::-1]]
                 matches = matches[np.unique(matches[:, 0], return_index=True)[1]]
+
             correct[matches[:, 1].astype(int), i] = True
+
         all_indices.append(x)
         all_matches.append(matches)
-    return torch.tensor(correct, dtype=torch.bool, device=detections.device), all_matches, all_indices
+        all_original_matches.append(original_matches)
+
+    correct_matrix = torch.tensor(correct, dtype=torch.bool, device=detections.device)
+    return correct_matrix, all_matches, all_indices, all_original_matches
 
 
 def xywh2xyxy(x):
@@ -188,7 +201,7 @@ def preprocess_predictions(images, results):
 
 
 # TODO: change
-def update_labels(gt_path, predictions, pr_label_positive, pr_label_negative, pr_bg_positive, conf):
+def update_labels(gt_path, predictions, pr_label_positive, pr_label_negative, pr_bg_positive, precision, conf):
 
     updated_labels = []
     UNMATCHED_CONF = 1e-4
@@ -215,25 +228,28 @@ def update_labels(gt_path, predictions, pr_label_positive, pr_label_negative, pr
             labels = torch.tensor(np.append(np.zeros((gt_boxes.shape[0], 1)), gt_boxes, axis=1))
             confs = torch.full((labels.shape[0], 1), UNMATCHED_CONF)
             precisions = torch.full((labels.shape[0], 1), P_T_N)
-            new_labels = torch.cat([labels[:, 1:], confs, precisions], axis=1)
+            cls = torch.full((labels.shape[0], 1), 0, dtype=torch.int64)
+            new_labels = torch.cat([labels[:, 1:], confs, precisions, cls], axis=1)
 
         elif nl == 0 and npr > 0:
             unmatched_detections_boxes = detections[:, :4]
             unmatched_detections_confs = detections[:, 4].unsqueeze(1)
             unmatched_detections_precisions = torch.tensor(
                 np.interp(unmatched_detections_confs, conf, pr_bg_positive[0, :], left=EPSILON))
-            new_labels = torch.cat([unmatched_detections_boxes, unmatched_detections_confs, unmatched_detections_precisions], axis=1)
-            new_labels = new_labels[new_labels[:, -1] >= 0.3]
+            unmatched_detections_cls = torch.full_like(unmatched_detections_precisions, 2, dtype=torch.int64)
+            new_labels = torch.cat([unmatched_detections_boxes, unmatched_detections_confs, unmatched_detections_precisions, unmatched_detections_cls], axis=1)
+            new_labels = new_labels[new_labels[:, -2] >= 0.3]
             # new_labels = torch.tensor([])
         else:
             gt_boxes = xywh2xyxy(gt_boxes.iloc[:, 1:].values) * 320
             labels = torch.tensor(np.append(np.zeros((gt_boxes.shape[0], 1)), gt_boxes, axis=1))
 
-            _, matches_iouv, matches_indices = _process_batch(detections, torch.tensor(labels), enable_iop=True)
-            matches = matches_iouv[0]
+            _, matches_iouv, matches_indices, raw_matches_iouv = _process_batch(detections, labels, enable_iop=True)
+            matches = matches_iouv[0]#.astype(int)
             indices = matches_indices[0]
+            raw_matches = raw_matches_iouv[0]#.astype(int)
 
-            # TODO: adjust label location/size?
+            # TODO: adjust label location/size using raw matches indices
             matched_labels_indices = torch.full((labels.shape[0],), False)
             matched_labels_indices[matches[:, 0]] = True
             unmatched_labels_indices = torch.logical_not(matched_labels_indices)
@@ -243,26 +259,52 @@ def update_labels(gt_path, predictions, pr_label_positive, pr_label_negative, pr
             unmatched_detections_indices = torch.full((detections.shape[0],), True)
             unmatched_detections_indices[indices[1]] = False
 
-            matched_labels_boxes = labels[matched_labels_indices, 1:]
-            matched_confs = detections[matched_detections_indices, 4].unsqueeze(1)
+            matched_labels_boxes = labels[matches[:, 0], 1:]
+            matched_confs = detections[matches[:, 1], 4].unsqueeze(1)
             matched_precisions = torch.tensor(np.interp(matched_confs, conf, pr_label_positive[0, :], left=EPSILON))
-            matched_labels = torch.cat([matched_labels_boxes, matched_confs, matched_precisions], axis=1)
+
+            matched_detections_boxes = detections[raw_matches[:, 1], :4]
+            matched_detections_confs = detections[raw_matches[:, 1], 4].unsqueeze(1)
+            matched_detections_precisions = torch.tensor(np.interp(matched_detections_confs, conf, precision[0, :], left=EPSILON))
+
+            new_matched_labels_boxes = []
+            if matches.shape[0] > 0:
+                for i in matches[:, 0]:
+                    current_detections_boxes = matched_detections_boxes[np.where(raw_matches[:, 0] == i)]
+                    current_detections_precisions = matched_detections_precisions[np.where(raw_matches[:, 0] == i)]
+
+                    current_labels_boxes = labels[int(i), 1:] * 0.9
+                    current_detections_weighted_boxes = torch.sum(current_detections_boxes * current_detections_precisions, dim=0)
+
+                    current_new_box = (current_labels_boxes + current_detections_weighted_boxes) / (0.9 + torch.sum(current_detections_precisions))
+
+                    new_matched_labels_boxes.append(current_new_box)
+                new_matched_labels_boxes = torch.stack(new_matched_labels_boxes)
+            else:
+                new_matched_labels_boxes = matched_labels_boxes
+            matched_labels_cls = torch.full_like(matched_precisions, 0, dtype=torch.int64)
+            matched_labels = torch.cat([new_matched_labels_boxes, matched_confs, matched_precisions, matched_labels_cls], axis=1)
 
             unmatched_labels_boxes = labels[unmatched_labels_indices, 1:]
             # TODO: change with the precision at position = 0.5?
             unmatched_confs = torch.full((unmatched_labels_boxes.shape[0], 1), UNMATCHED_CONF)
             unmatched_precisions = torch.full((unmatched_labels_boxes.shape[0], 1), P_T_N)
-            unmatched_labels = torch.cat([unmatched_labels_boxes, unmatched_confs, unmatched_precisions], axis=1)
+            unmatched_labels_cls = torch.full_like(unmatched_precisions, 1, dtype=torch.int64)
+            unmatched_labels = torch.cat([unmatched_labels_boxes, unmatched_confs, unmatched_precisions, unmatched_labels_cls], axis=1)
 
             unmatched_detections_boxes = detections[unmatched_detections_indices, :4]
             unmatched_detections_confs = detections[unmatched_detections_indices, 4].unsqueeze(1)
             unmatched_detections_precisions = torch.tensor(np.interp(unmatched_detections_confs, conf, pr_bg_positive[0, :], left=EPSILON))
-            unmatched_detections = torch.cat([unmatched_detections_boxes, unmatched_detections_confs, unmatched_detections_precisions], axis=1)
-            unmatched_detections = unmatched_detections[unmatched_detections[:, -1] >= 0.3]
+            unmatched_detections_cls = torch.full_like(unmatched_detections_precisions, 2, dtype=torch.int64)
+            unmatched_detections = torch.cat([unmatched_detections_boxes, unmatched_detections_confs, unmatched_detections_precisions, unmatched_detections_cls], axis=1)
+            unmatched_detections = unmatched_detections[unmatched_detections[:, -2] >= 0.3]
 
             new_labels = torch.cat([matched_labels, unmatched_labels, unmatched_detections], axis=0)
-
+            nms_indices = nms(new_labels[:, :4], new_labels[:, 5], iou_threshold=0.3)
+            new_labels = new_labels[nms_indices, :]
         # new_labels[:, 4] = torch.tensor(np.interp(new_labels[:, 4], conf, precision[0, :], left=EPSILON))
+        if len(new_labels) > 0:
+            new_labels = new_labels[new_labels[:, -2] >= 0.3]
         updated_labels.append({"file": fn_origin, "labels": new_labels, "img_path": gt_path.replace("labels", "images")})
     return updated_labels
 
@@ -305,7 +347,7 @@ def calculate_match(gt_path, predictions):
 
             labels = torch.tensor(np.append(np.zeros((gt_boxes.shape[0], 1)), gt_boxes, axis=1))
 
-            correct_bboxes, _, _ = _process_batch(detections, labels)
+            correct_bboxes, _, _, _ = _process_batch(detections, labels)
 
         total_img += 1
         print(correct_bboxes.shape, correct_bboxes.sum(), cls.squeeze(-1).shape)
@@ -396,7 +438,7 @@ def conf_to_precision(tp, conf, pred_cls, target_cls, avg_gt_size, total_img, ep
 
         # Precision
         precision = tpc / (tpc + fpc)  # precision curve
-        # p[ci] = np.interp(-px, -conf[i], precision[:, 0], left=1)  # p at pr_score
+        p[ci] = np.interp(-px, -conf[i], precision[:, 0], left=1)  # p at pr_score
 
         p_true = n_l / (n_l + n_b)
         p_label_true = 0.8
@@ -418,7 +460,7 @@ def conf_to_precision(tp, conf, pred_cls, target_cls, avg_gt_size, total_img, ep
         p_false_bg_positive = (1 - p_label_false) * p_positive_false * (1 - p_true)
         p_true_bg_positive /= p_true_bg_positive + p_false_bg_positive
         pr_bg_positive[ci] = np.interp(-px, -conf[i], p_true_bg_positive[:, 0])
-    return pr_label_positive, pr_label_negative, pr_bg_positive, px
+    return pr_label_positive, pr_label_negative, pr_bg_positive, p, px
 
 
 def write_labels(file_path, labels_array):
@@ -443,6 +485,37 @@ def write_weights(file_path, weights_array):
             pass
 
 
+def write_next_dataset(dataset_path, dataset_name, new_labels, old_name):
+    # create new dataset
+    new_dataset_path = os.path.join(dataset_path, dataset_name)
+    new_train_images_path = os.path.join(new_dataset_path, "train", "images")
+    new_train_labels_path = os.path.join(new_dataset_path, "train", "labels")
+    new_train_weights_path = os.path.join(new_dataset_path, "train", "weights")
+
+    os.makedirs(new_train_images_path)
+    os.makedirs(new_train_labels_path)
+    os.makedirs(new_train_weights_path)
+    for ele in new_labels:
+        original_image_path = os.path.join(ele["img_path"], ele["file"]+".jpg")
+        new_label_path = os.path.join(new_train_labels_path, ele["file"]+".txt")
+        new_weight_path = os.path.join(new_train_weights_path, ele["file"] + ".txt")
+        if len(ele["labels"]) > 0:
+            labels_numpy = ele["labels"].cpu().detach().numpy()
+            labels_array = xyxy2xywh(np.clip(labels_numpy[:, :4] / 320, a_min=0.0, a_max=None))
+            labels_array = np.concatenate([labels_numpy[:, [6]].astype(np.int), labels_array], axis=1)
+            weights_array = labels_numpy[:, [5]]
+        else:
+            labels_array = None
+            weights_array = None
+
+        shutil.copy2(original_image_path, new_train_images_path)
+        write_labels(new_label_path, labels_array)
+        write_weights(new_weight_path, weights_array)
+
+    copy_tree(os.path.join(dataset_path, old_name, "valid"), os.path.join(dataset_path, dataset_name, "valid"))
+    write_next_directory_yaml_file(os.path.join(dataset_path, "Pore-detection-14", "data.yaml"))
+
+
 def confident_learning(root_path, dataset_path):
     run_idx = 1
     all_updated_labels = []
@@ -452,7 +525,6 @@ def confident_learning(root_path, dataset_path):
             continue
         run_idx_str = "" if run_idx == 1 else str(run_idx)
         yaml_path = os.path.join(dataset_path, path, "data.yaml")
-        val_img_path = os.path.join(dataset_path, path, "valid", "images")
         gt_path = os.path.join(dataset_path, path, "valid", "labels")
         predictions_path = os.path.join(root_path, "runs", "detect", f"val{run_idx_str}", "predictions.json")
         test_img_path = os.path.join(dataset_path, path, "test", "images")
@@ -462,25 +534,9 @@ def confident_learning(root_path, dataset_path):
         model.train(data=yaml_path, epochs=200, imgsz=320, lr0=1e-3)
         model.val(data=yaml_path, save_json=True)
 
-        # # test
-        # val_images = []
-        # val_image_fns = []
-        # for img_fn in os.listdir(val_img_path):
-        #     img_path = os.path.join(val_img_path, img_fn)
-        #     if os.path.isfile(img_path):
-        #         val_images.append(Image.open(img_path))
-        #         val_image_fns.append(img_fn)
-
-        # val_predictions = model.predict(source=val_images, conf=0.001)
-
-        # calculate bboxes
-
-        # stats = calculate_match(gt_path, preprocess_predictions(val_image_fns, val_predictions))
         stats, avg_gt_size, total_img = calculate_match(gt_path, read_predictions(predictions_path))
 
-        # calculate confidence to precision map.
-
-        pr_label_positive, pr_label_negative, pr_bg_positive, conf = conf_to_precision(*stats, avg_gt_size, total_img)
+        pr_label_positive, pr_label_negative, pr_bg_positive, precision, conf = conf_to_precision(*stats, avg_gt_size, total_img)
         run_idx += 1
 
         # test
@@ -499,37 +555,21 @@ def confident_learning(root_path, dataset_path):
             pr_label_positive,
             pr_label_negative,
             pr_bg_positive,
+            precision,
             conf)
         all_updated_labels.extend(updated_labels)
 
-    # create new dataset
-    new_dataset_path = os.path.join(dataset_path, "Pore-detection-15")
-    new_train_images_path = os.path.join(new_dataset_path, "train", "images")
-    new_train_labels_path = os.path.join(new_dataset_path, "train", "labels")
-    new_train_weights_path = os.path.join(new_dataset_path, "train", "weights")
+    write_next_dataset(dataset_path, "Pore-detection-15", all_updated_labels, "Pore-detection-14")
 
-    os.makedirs(new_train_images_path)
-    os.makedirs(new_train_labels_path)
-    os.makedirs(new_train_weights_path)
-    for ele in all_updated_labels:
-        original_image_path = os.path.join(ele["img_path"], ele["file"]+".jpg")
-        new_label_path = os.path.join(new_train_labels_path, ele["file"]+".txt")
-        new_weight_path = os.path.join(new_train_weights_path, ele["file"] + ".txt")
-        if len(ele["labels"]) > 0:
-            labels_array = xyxy2xywh(np.clip(ele["labels"][:, :4].cpu().detach().numpy() / 320, a_min=0.0, a_max=None))
-            labels_array = np.concatenate([np.zeros((labels_array.shape[0], 1), dtype=np.int), labels_array], axis=1)
-            weights_array = ele["labels"][:, [5]].cpu().detach().numpy()
-        else:
-            labels_array = None
-            weights_array = None
-
-        shutil.copy2(original_image_path, new_train_images_path)
-        write_labels(new_label_path, labels_array)
-        write_weights(new_weight_path, weights_array)
-
-    copy_tree(os.path.join(dataset_path, "Pore-detection-14", "valid"), os.path.join(dataset_path, "Pore-detection-15", "valid"))
-    write_next_directory_yaml_file(os.path.join(dataset_path, "Pore-detection-14", "data.yaml"))
+if __name__ == "__main__":
+    from ultralytics.yolo.utils.ops import non_max_suppression
+    from torchvision.ops import nms
 
 
+    label = xywh2xyxy(np.array([[0.8218125000000001, 0.85796875, 0.033625000000000016, 0.03409374999999992]])) * 320
+    detection = xywh2xyxy(np.array([[0.8125, 0.8640625, 0.03750000000000009, 0.04062500000000002]])) * 320
 
+    all_boxes = torch.cat([torch.tensor(label), torch.tensor(detection)], dim=0)
+    scores = torch.tensor([0.1, 0.6], dtype=torch.float64)
+    print(nms(all_boxes, scores, 0.5))
 

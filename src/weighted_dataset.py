@@ -69,11 +69,14 @@ class YOLODataset(BaseDataset):
                 ne += ne_f
                 nc += nc_f
                 if im_file:
+                    # TODO: fake label
+                    fake_label = np.zeros_like(lb[:, 0:1])
+                    fake_weights = np.ones_like(weights)
                     x["labels"].append(
                         dict(
                             im_file=im_file,
                             shape=shape,
-                            cls=np.concatenate([lb[:, 0:1], weights], axis=1),  # n, 1
+                            cls=np.concatenate([fake_label, fake_weights], axis=1),  # n, 1
                             bboxes=lb[:, 1:],  # n, 4
                             weights=weights,
                             segments=segments,

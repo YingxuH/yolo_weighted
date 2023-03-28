@@ -7,6 +7,6 @@ roboflow:
   url: https://app.roboflow.com/skin-care/pore-detection/14
   version: 14
   workspace: skin-care
-test: ../test/images
-train: Pore-detection-14-1/train/images
-val: Pore-detection-14-1/valid/images
+test: pore-detection-14/test/images
+train: pore-detection-14-1/train/images
+val: pore-detection-14-1/valid/images
